@@ -27,7 +27,7 @@
   }
   .mode {
     font-size: 0.8rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
-    padding: 0.7em 1.6em; background: #000; color: #fff; border: none;
+    padding: 0.7em 1.1em; background: #000; color: #fff; border: none;
     touch-action: manipulation;
   }
   .mode[aria-selected="true"] { background: #fff; color: #000; }
@@ -51,6 +51,7 @@
   <div id="modes" role="tablist">
     <button class="mode" id="mode-listen" role="tab" aria-selected="true">Listen</button>
     <button class="mode" id="mode-mic" role="tab" aria-selected="false">Mic</button>
+    <button class="mode" id="mode-both" role="tab" aria-selected="false">Both</button>
   </div>
   <p id="hint"></p>
   <button id="start">START</button>
@@ -71,12 +72,15 @@ const hintEl = document.getElementById("hint");
 const player = document.getElementById("player");
 const modeListenBtn = document.getElementById("mode-listen");
 const modeMicBtn = document.getElementById("mode-mic");
+const modeBothBtn = document.getElementById("mode-both");
 
 let pc = null;
 let micStream = null;
 let statsTimer = null;
-let prevRtp = null;
-let mode = "listen";  // "listen" = PC->AirPods, "mic" = phone mic -> PC
+let prevInbound = null;
+let prevOutbound = null;
+let mode = "listen";  // "listen" = PC->AirPods, "mic" = phone mic -> PC,
+                      // "both" = duplex (hear the PC while the mic feeds it)
 
 function setStatus(text) { statusEl.textContent = text; }
 
@@ -89,6 +93,10 @@ const micSupported = window.isSecureContext &&
 function refreshHint() {
   if (mode === "listen") {
     hintEl.textContent = "Play this PC's audio through your AirPods.";
+  } else if (mode === "both") {
+    hintEl.textContent = micSupported
+      ? "Two-way: hear the PC while your iPhone's mic feeds it."
+      : "Both needs the https:// address — reopen this page there.";
   } else if (micSupported) {
     hintEl.textContent = "Use your iPhone's microphone as a PC input.";
   } else {
@@ -101,43 +109,52 @@ function selectMode(next) {
   mode = next;
   modeListenBtn.setAttribute("aria-selected", String(next === "listen"));
   modeMicBtn.setAttribute("aria-selected", String(next === "mic"));
+  modeBothBtn.setAttribute("aria-selected", String(next === "both"));
   refreshHint();
 }
 
 modeListenBtn.addEventListener("click", () => selectMode("listen"));
 modeMicBtn.addEventListener("click", () => selectMode("mic"));
+modeBothBtn.addEventListener("click", () => selectMode("both"));
 
-// Live diagnostics. Listen mode reads the receive jitter buffer (the browser's
-// share of total delay); mic mode reads the outbound packet rate so you can see
+// Live diagnostics. Listen/Both read the receive jitter buffer (the browser's
+// share of total delay); Mic/Both read the outbound packet rate so you can see
 // the mic is actually sending (~50 pkt/s at 20 ms ptime).
 function startStats() {
   stopStats();
   statsTimer = setInterval(async () => {
     if (!pc || pc.connectionState !== "connected") return;
     const report = await pc.getStats();
-    const wantType = mode === "listen" ? "inbound-rtp" : "outbound-rtp";
+    let bufferMs = null, sentRate = null;
     report.forEach((entry) => {
-      if (entry.type !== wantType || entry.kind !== "audio") return;
-      if (mode === "listen" && prevRtp && entry.jitterBufferDelay !== undefined) {
-        const delay = entry.jitterBufferDelay - prevRtp.jitterBufferDelay;
-        const count = entry.jitterBufferEmittedCount - prevRtp.jitterBufferEmittedCount;
-        const lost = Math.max(0, (entry.packetsLost || 0) - (prevRtp.packetsLost || 0));
-        if (count > 0) {
-          statsEl.textContent =
-            "buffer " + Math.round((delay / count) * 1000) + " ms · " + lost + " pkt lost/s";
+      if (entry.kind !== "audio") return;
+      if (entry.type === "inbound-rtp" && (mode === "listen" || mode === "both")) {
+        if (prevInbound && prevInbound.id === entry.id &&
+            entry.jitterBufferDelay !== undefined) {
+          const delay = entry.jitterBufferDelay - prevInbound.jitterBufferDelay;
+          const count = entry.jitterBufferEmittedCount - prevInbound.jitterBufferEmittedCount;
+          if (count > 0) bufferMs = Math.round((delay / count) * 1000);
         }
-      } else if (mode === "mic" && prevRtp && entry.packetsSent !== undefined) {
-        const sent = entry.packetsSent - prevRtp.packetsSent;
-        statsEl.textContent = "sending " + sent + " pkt/s";
+        prevInbound = entry;
+      } else if (entry.type === "outbound-rtp" && (mode === "mic" || mode === "both")) {
+        if (prevOutbound && prevOutbound.id === entry.id &&
+            entry.packetsSent !== undefined) {
+          sentRate = entry.packetsSent - prevOutbound.packetsSent;
+        }
+        prevOutbound = entry;
       }
-      prevRtp = entry;
     });
+    const parts = [];
+    if (bufferMs !== null) parts.push("buffer " + bufferMs + " ms");
+    if (sentRate !== null) parts.push("sending " + sentRate + " pkt/s");
+    if (parts.length) statsEl.textContent = parts.join(" · ");
   }, 1000);
 }
 
 function stopStats() {
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
-  prevRtp = null;
+  prevInbound = null;
+  prevOutbound = null;
   statsEl.textContent = "";
 }
 
@@ -163,7 +180,7 @@ function cleanup() {
 
 async function start() {
   startBtn.disabled = true;
-  modeListenBtn.disabled = modeMicBtn.disabled = true;
+  modeListenBtn.disabled = modeMicBtn.disabled = modeBothBtn.disabled = true;
   setStatus("Connecting…");
 
   // Same-LAN only: host candidates are enough, no STUN/TURN servers needed.
@@ -171,12 +188,15 @@ async function start() {
   const endpoint = mode === "mic" ? "/mic-offer" : "/offer";
 
   try {
-    if (mode === "listen") {
+    if (mode === "listen" || mode === "both") {
       // Unlock audio while still inside the click gesture: iOS Safari only
       // honors .play() calls traceable to a user interaction. Playing the
       // (empty) element now grants playback for the stream arriving later.
       player.play().catch(() => {});
 
+      // Speaker transceiver FIRST: the server attaches its loopback track to
+      // the first transceiver it can send on (recvonly), so ordering here
+      // deterministically pairs directions in the Both offer.
       const transceiver = pc.addTransceiver("audio", { direction: "recvonly" });
       // LATENCY KNOB: ask for the minimum receive jitter buffer (0 = as low as
       // the browser dares; it keeps an internal floor and adapts up on bad WiFi).
@@ -188,6 +208,18 @@ async function start() {
         player.srcObject = evt.streams[0];
         player.play().catch(() => setStatus("Audio blocked — tap Start again"));
       });
+
+      if (mode === "both") {
+        if (!micSupported) throw new Error("mic needs the https:// address");
+        // Raw-ish mic: leave echo cancellation off (not a call), keep noise
+        // suppression + auto gain so it's usable as a general PC microphone.
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
+        });
+        for (const micTrack of micStream.getAudioTracks()) {
+          pc.addTransceiver(micTrack, { direction: "sendonly" });
+        }
+      }
     } else {
       if (!micSupported) throw new Error("mic needs the https:// address");
       // Raw-ish mic: leave echo cancellation off (not a call), keep noise
@@ -202,21 +234,23 @@ async function start() {
   } catch (err) {
     setStatus("Error: " + err.message);
     startBtn.disabled = false;
-    modeListenBtn.disabled = modeMicBtn.disabled = false;
+    modeListenBtn.disabled = modeMicBtn.disabled = modeBothBtn.disabled = false;
     cleanup();
     return;
   }
 
   pc.addEventListener("connectionstatechange", () => {
     if (pc.connectionState === "connected") {
-      setStatus(mode === "mic"
-        ? "Mic live — keep this page open & screen on"
-        : "Streaming — keep this page open & screen on");
+      setStatus(mode === "listen"
+        ? "Streaming — keep this page open & screen on"
+        : mode === "both"
+          ? "Two-way live — keep this page open & screen on"
+          : "Mic live — keep this page open & screen on");
       startStats();
     } else if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
       setStatus("Disconnected — tap Start to reconnect");
       startBtn.disabled = false;
-      modeListenBtn.disabled = modeMicBtn.disabled = false;
+      modeListenBtn.disabled = modeMicBtn.disabled = modeBothBtn.disabled = false;
       stopStats();
       cleanup();
     } else {

@@ -517,7 +517,19 @@ async def offer(request: web.Request) -> web.Response:
     request.app["pcs"].add(pc)
     track = LoopbackAudioTrack(request.app["capture"])
     pc.addTrack(track)
+    playback = request.app.get("mic_playback")
     log.info("New peer (%d active)", len(request.app["pcs"]))
+
+    @pc.on("track")
+    def on_incoming_track(incoming: MediaStreamTrack) -> None:
+        """Duplex mode ("Both" on the page): the phone's offer may carry a
+        sendonly mic track alongside the recvonly speaker transceiver. Route
+        it into the mic playback device exactly like /mic-offer does."""
+        if incoming.kind != "audio" or playback is None:
+            return
+        task = asyncio.ensure_future(playback.consume(incoming))
+        request.app["mic_tasks"].add(task)
+        task.add_done_callback(request.app["mic_tasks"].discard)
 
     @pc.on("connectionstatechange")
     async def on_state_change() -> None:
