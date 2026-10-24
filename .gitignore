@@ -7,6 +7,10 @@ __pycache__/
 .mic-cert.pem
 .mic-key.pem
 
+# Runtime logs (autostart wrapper + SDP diagnostics)
+server_autostart.log
+sdp_debug.log
+
 # Local agent tooling / editor state — not part of the app
 .agents/
 .atelier/
