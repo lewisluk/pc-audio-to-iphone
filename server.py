@@ -30,6 +30,7 @@ import socket
 import ssl
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pyaudiowpatch as pyaudio
@@ -41,6 +42,87 @@ from av.audio.resampler import AudioResampler
 
 ROOT = Path(__file__).parent
 DEFAULT_PORT = 8080
+SDP_DEBUG_LOG = ROOT / "sdp_debug.log"
+
+
+def _primary_ipv4() -> str | None:
+    """The PC's primary non-loopback IPv4 (no packet is actually sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        return None if ip.startswith("127.") else ip
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def _bridge_guess() -> str | None:
+    """Guess the phone's LAN address: the PC's subnet base + .1 (the iPhone
+    hotspot bridge is always the gateway of the PC's hotspot subnet)."""
+    ip = _primary_ipv4()
+    if not ip:
+        return None
+    parts = ip.rsplit(".", 1)
+    return parts[0] + ".1"
+
+
+def resolve_mdns_candidates(sdp: str) -> str:
+    """Handle Safari's mDNS-obfuscated host candidates.
+
+    Safari hides local IPs behind per-interface randomized `.local` hostnames.
+    aioice resolves them with its own mDNS query under a ~1 s timeout, which
+    can drop candidates entirely (leaving only the phone's unreachable
+    cellular-interface addresses, so ICE hangs in "connecting").
+
+    For each mDNS host candidate we:
+      1. pre-resolve the hostname with the OS resolver (A + AAAA, IPv4
+         preferred) and substitute the real IP if that succeeds;
+      2. additionally inject a duplicate candidate aimed at the phone's LAN
+         address (subnet base + .1, same port) so ICE also probes the direct
+         LAN path — in iPhone-hotspot setups iOS Safari may fail to gather a
+         candidate for its own hotspot bridge interface.
+    Unresolved lines are left untouched for aioice to try itself.
+    """
+    bridge = _bridge_guess()
+    out = []
+    for line in sdp.splitlines():
+        if not (line.startswith("a=candidate:") and ".local" in line
+                and " typ host" in line):
+            out.append(line)
+            continue
+        parts = line.split()
+        # a=candidate:<fnd> <comp> <transport> <priority> <host> <port> typ host
+        if len(parts) < 8:
+            out.append(line)
+            continue
+        fnd, comp, proto, prio = parts[0], parts[1], parts[2], parts[3]
+        host, port = parts[4], parts[5]
+        try:
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
+            ip = next(a[4][0] for a in infos if a[0] == socket.AF_INET) \
+                if any(a[0] == socket.AF_INET for a in infos) \
+                else infos[0][4][0]
+            line = line.replace(host, ip)
+        except (OSError, ValueError, StopIteration):
+            pass
+        out.append(line)
+        if bridge:
+            out.append("a=candidate:%s-alt %s %s %s %s %s typ host" % (
+                fnd.split(":", 1)[1], comp, proto, prio, bridge, port))
+    return "\n".join(out) + "\n"
+
+
+def log_raw_sdp(sdp: str, tag: str) -> None:
+    """Append the phone's raw offer SDP to sdp_debug.log for diagnostics."""
+    try:
+        with open(SDP_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write("\n===== %s offer %s =====\n%s\n" % (
+                tag, datetime.now().isoformat(timespec="seconds"),
+                sdp))
+    except OSError:
+        pass
 
 # Capture block size. 20 ms matches aiortc's Opus packet time (ptime), which is
 # hard-coded to 20 ms in aiortc (aiortc.codecs.opus, 960 samples @ 48 kHz) —
@@ -426,7 +508,10 @@ async def offer(request: web.Request) -> web.Response:
     """Standard aiortc offer/answer exchange: the phone POSTs its SDP offer
     (candidates included, no trickle) and gets the complete answer back."""
     params = await request.json()
-    remote_offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    log_raw_sdp(params["sdp"], "listen")
+    remote_offer = RTCSessionDescription(
+        sdp=resolve_mdns_candidates(params["sdp"]), type=params["type"]
+    )
 
     pc = RTCPeerConnection()
     request.app["pcs"].add(pc)
@@ -454,7 +539,9 @@ async def mic_offer(request: web.Request) -> web.Response:
     its microphone; the PC receives the track and plays it into the mic
     playback device. Same non-trickle offer/answer shape as /offer."""
     params = await request.json()
-    remote_offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    remote_offer = RTCSessionDescription(
+        sdp=resolve_mdns_candidates(params["sdp"]), type=params["type"]
+    )
 
     pc = RTCPeerConnection()
     request.app["pcs"].add(pc)
