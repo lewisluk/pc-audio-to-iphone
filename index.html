@@ -57,10 +57,14 @@
   <button id="start">START</button>
   <p id="status">Tap Start to connect</p>
   <p id="stats"></p>
-  <!-- playsinline + autoplay: sound still only starts after the user-gesture
-       unlock performed inside the Start click handler (iOS Safari policy).
-       Used in Listen mode only; Mic mode never plays anything back. -->
-  <audio id="player" autoplay playsinline></audio>
+  <!-- iOS route workaround: when the mic is live (Mic/Both mode), iOS
+       switches the audio session to "call" and routes <audio> playback to
+       the earpiece. A <video> element keeps the media route (loudspeaker),
+       so the stream plays through a 1-px transparent video instead.
+       playsinline + autoplay: sound still only starts after the user-gesture
+       unlock performed inside the Start click handler (iOS Safari policy). -->
+  <video id="player" autoplay playsinline
+         style="width:1px;height:1px;opacity:0.01;position:fixed;top:0;left:0;pointer-events:none;"></video>
 </main>
 
 <script>
