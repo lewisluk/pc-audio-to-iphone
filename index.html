@@ -180,6 +180,7 @@ function waitForIceGathering(pc) {
 function cleanup() {
   if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
   if (pc) { pc.close(); pc = null; }
+  if (player) { try { player.pause(); player.srcObject = null; } catch (e) {} }
   // Release the audio session back to plain playback, otherwise iOS keeps it
   // in play-and-record and the next Listen session comes out of the earpiece
   // at degraded quality. Two writes, no delay needed (WebKit bug 282939).
@@ -187,6 +188,16 @@ function cleanup() {
     try { navigator.audioSession.type = "playback"; } catch (e) {}
     try { navigator.audioSession.type = "auto"; } catch (e) {}
   }
+}
+
+// Listen has no microphone, so nothing forces the play-and-record category —
+// but iOS clings to that category after a Both/Mic session (we set it
+// explicitly for the route kick) and would drag Listen into call mode with the
+// capped call-volume slider. Declaring 'playback' here kicks the session back
+// to media routing, independent of whatever ran before.
+function requestMediaSession() {
+  if (!navigator.audioSession) return;
+  try { navigator.audioSession.type = "playback"; } catch (e) {}
 }
 
 // Ask the OS for the mic, then re-declare the audio session as play-and-record.
@@ -216,6 +227,10 @@ async function start() {
 
   try {
     if (mode === "listen" || mode === "both") {
+      // Listen must never inherit a stale play-and-record session from an
+      // earlier Both/Mic run (that is what caps it at call volume).
+      if (mode === "listen") requestMediaSession();
+
       // Unlock audio while still inside the click gesture: iOS Safari only
       // honors .play() calls traceable to a user interaction. Playing the
       // (empty) element now grants playback for the stream arriving later.
@@ -233,6 +248,9 @@ async function start() {
 
       pc.addEventListener("track", (evt) => {
         player.srcObject = evt.streams[0];
+        // Re-assert the media session once real audio arrives: iOS may
+        // re-evaluate the category when playback starts.
+        if (mode === "listen") requestMediaSession();
         player.play().catch(() => setStatus("Audio blocked — tap Start again"));
       });
 
