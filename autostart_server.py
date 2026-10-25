@@ -35,6 +35,11 @@ CAPTURE_DEVICE_HINT = ""
 # AudioRelay" or VB-CABLE's "CABLE Output"). Leave "" for the system default
 # output (phone mic simply plays out loud).
 MIC_DEVICE_HINT = "Virtual Speakers"
+# Software gain applied before Opus encoding / before the mic PCM is played.
+# Needed because an active mic puts the iOS page in a play-and-record session,
+# where the volume key controls CALL volume (capped below media volume).
+GAIN = 2.0
+MIC_GAIN = 2.0
 NETWORK_TIMEOUT_S = 180  # max seconds to wait for a LAN address at boot
 # ---------------------------------------------------------------------------
 
@@ -129,6 +134,10 @@ def main():
         log("mic playback device pinned by hint %r -> index %d" % (MIC_DEVICE_HINT, mic_idx))
     elif MIC_DEVICE_HINT:
         log("WARNING: no output device matching %r, mic uses default" % MIC_DEVICE_HINT)
+    if GAIN != 1.0:
+        argv += ["--gain", str(GAIN)]
+    if MIC_GAIN != 1.0:
+        argv += ["--mic-gain", str(MIC_GAIN)]
 
     log("launching: %s %s" % (PYTHON_EXE, " ".join(argv)))
     # 3. Run server.py in-process so its output lands in our log file.

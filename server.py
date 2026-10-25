@@ -132,6 +132,35 @@ CHUNK_S = CHUNK_MS / 1000
 
 log = logging.getLogger("airpods-bridge")
 
+try:
+    import audioop  # stdlib C speed s16 gain; deprecated in 3.13 but we pin 3.12
+except ImportError:  # pragma: no cover - python 3.13+
+    audioop = None
+
+
+def apply_gain(data: bytes, gain: float) -> bytes:
+    """Multiply s16le PCM by `gain`, saturating at full scale.
+
+    Used to lift quiet sources. It matters more than it looks: while the mic
+    is live iOS puts the page in a play-and-record session, so the phone's
+    volume key controls CALL volume (capped well below media volume) instead
+    of media volume — the web has no way to change that category. Raising the
+    signal before Opus encoding recovers the loudness at the same setting.
+    """
+    if gain == 1.0 or not data:
+        return data
+    if audioop is not None:
+        return audioop.mul(data, 2, gain)
+    # Fallback: pure-python s16 saturation (python 3.13 without audioop).
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(data)
+    for i, value in enumerate(samples):
+        scaled = int(value * gain)
+        samples[i] = 32767 if scaled > 32767 else -32768 if scaled < -32768 else scaled
+    return samples.tobytes()
+
 
 # --------------------------------------------------------------------------- #
 # Audio capture
@@ -161,9 +190,11 @@ class LoopbackCapture:
     never growing delay.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, device_index: int | None = None):
+    def __init__(self, loop: asyncio.AbstractEventLoop, device_index: int | None = None,
+                 gain: float = 1.0):
         self._loop = loop
         self._pa = pyaudio.PyAudio()
+        self._gain = gain
         self.device = self._pick_device(device_index)
         self.rate = int(self.device["defaultSampleRate"])
         # Opus is mono/stereo only; take the first 2 channels of >2ch devices.
@@ -221,6 +252,8 @@ class LoopbackCapture:
                 break
             with self._sub_lock:
                 subscribers = list(self._subscribers)
+            if subscribers and self._gain != 1.0:
+                chunk = apply_gain(chunk, self._gain)
             for queue in subscribers:
                 self._loop.call_soon_threadsafe(self._offer_chunk, queue, chunk)
 
@@ -358,9 +391,11 @@ class MicPlayback:
     a glitch, never growing delay.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, device_index: int | None = None):
+    def __init__(self, loop: asyncio.AbstractEventLoop, device_index: int | None = None,
+                 gain: float = 1.0):
         self._loop = loop
         self._pa = pyaudio.PyAudio()
+        self._gain = gain
         self.device = self._pick_output(device_index)
         self.rate = int(self.device["defaultSampleRate"])
         self.channels = min(int(self.device["maxOutputChannels"]) or 2, 2)
@@ -484,7 +519,8 @@ class MicPlayback:
                     # Packed s16: one plane of interleaved samples. Slice to the
                     # exact valid length (av may pad the buffer) — reading the
                     # plane bytes directly avoids a numpy dependency.
-                    self._enqueue(bytes(out.planes[0])[: out.samples * self.channels * 2])
+                    pcm = bytes(out.planes[0])[: out.samples * self.channels * 2]
+                    self._enqueue(apply_gain(pcm, self._gain))
         except MediaStreamError:
             pass
         finally:
@@ -684,13 +720,14 @@ def ensure_self_signed_cert() -> tuple[Path, Path] | None:
 # --------------------------------------------------------------------------- #
 # Lifecycle
 # --------------------------------------------------------------------------- #
-def make_on_startup(device_index: int | None, mic_device_index: int | None):
+def make_on_startup(device_index: int | None, mic_device_index: int | None,
+                    gain: float = 1.0, mic_gain: float = 1.0):
     async def on_startup(app: web.Application) -> None:
         loop = asyncio.get_running_loop()
-        capture = LoopbackCapture(loop, device_index)
+        capture = LoopbackCapture(loop, device_index, gain)
         capture.start()
         app["capture"] = capture
-        app["mic_playback"] = MicPlayback(loop, mic_device_index)
+        app["mic_playback"] = MicPlayback(loop, mic_device_index, mic_gain)
         app["mic_tasks"] = set()
 
     return on_startup
@@ -806,6 +843,12 @@ def main() -> None:
     parser.add_argument("--mic-device", type=int, default=None,
                         help="output device index to play the phone's mic into (default: system default "
                              "output). Point at a virtual cable (VB-CABLE) to make the phone a real microphone.")
+    parser.add_argument("--gain", type=float, default=1.0, metavar="X",
+                        help="software gain for the captured PC audio before Opus (default 1.0). "
+                             "Raise it to compensate for the phone's capped call-volume slider.")
+    parser.add_argument("--mic-gain", type=float, default=1.0, metavar="X",
+                        help="software gain for the phone microphone before it is played into "
+                             "--mic-device (default 1.0).")
     parser.add_argument("--list-devices", action="store_true", help="list capture + output devices and exit")
     args = parser.parse_args()
 
@@ -821,7 +864,8 @@ def main() -> None:
     app.router.add_get("/", index)
     app.router.add_post("/offer", offer)
     app.router.add_post("/mic-offer", mic_offer)
-    app.on_startup.append(make_on_startup(args.device, args.mic_device))
+    app.on_startup.append(make_on_startup(args.device, args.mic_device,
+                                          args.gain, args.mic_gain))
     app.on_shutdown.append(on_shutdown)
     try:
         asyncio.run(run_servers(app, args.port))
