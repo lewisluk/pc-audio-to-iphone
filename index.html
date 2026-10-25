@@ -180,6 +180,29 @@ function waitForIceGathering(pc) {
 function cleanup() {
   if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
   if (pc) { pc.close(); pc = null; }
+  // Release the audio session back to plain playback, otherwise iOS keeps it
+  // in play-and-record and the next Listen session comes out of the earpiece
+  // at degraded quality. Two writes, no delay needed (WebKit bug 282939).
+  if (navigator.audioSession) {
+    try { navigator.audioSession.type = "playback"; } catch (e) {}
+    try { navigator.audioSession.type = "auto"; } catch (e) {}
+  }
+}
+
+// Ask the OS for the mic, then re-declare the audio session as play-and-record.
+// Native apps set AVAudioSession .defaultToSpeaker here; the web has no such
+// option, and WebKit's implicit category routes our playback to the earpiece.
+// Setting the type explicitly *after* getUserMedia is the documented kick that
+// makes iOS re-evaluate the route (WebKit bug 282939) - the ordering matters:
+// setting it before getUserMedia succeeds only about half the time.
+async function getMicWithRouteKick() {
+  const session = navigator.audioSession;
+  if (session) { try { session.type = "auto"; } catch (e) {} }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
+  });
+  if (session) { try { session.type = "play-and-record"; } catch (e) {} }
+  return stream;
 }
 
 async function start() {
@@ -215,22 +238,17 @@ async function start() {
 
       if (mode === "both") {
         if (!micSupported) throw new Error("mic needs the https:// address");
-        // Raw-ish mic: leave echo cancellation off (not a call), keep noise
-        // suppression + auto gain so it's usable as a general PC microphone.
-        micStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
-        });
+        // Raw-ish mic (no echo cancellation - not a call), noise suppression +
+        // auto gain on so it works as a general PC microphone. The helper also
+        // kicks the iOS audio session so playback stays on the loudspeaker.
+        micStream = await getMicWithRouteKick();
         for (const micTrack of micStream.getAudioTracks()) {
           pc.addTransceiver(micTrack, { direction: "sendonly" });
         }
       }
     } else {
       if (!micSupported) throw new Error("mic needs the https:// address");
-      // Raw-ish mic: leave echo cancellation off (not a call), keep noise
-      // suppression + auto gain so it's usable as a general PC microphone.
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
-      });
+      micStream = await getMicWithRouteKick();
       for (const track of micStream.getAudioTracks()) {
         pc.addTransceiver(track, { direction: "sendonly" });
       }
